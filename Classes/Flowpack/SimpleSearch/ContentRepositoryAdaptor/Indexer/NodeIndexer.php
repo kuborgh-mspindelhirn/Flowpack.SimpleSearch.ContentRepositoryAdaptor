@@ -90,39 +90,76 @@ class NodeIndexer extends \TYPO3\TYPO3CR\Search\Indexer\AbstractNodeIndexer {
 	 *
 	 * @param NodeInterface $node
 	 * @param string $targetWorkspaceName
-	 * @param boolean $indexVariants
 	 * @return void
 	 */
-	public function indexNode(NodeInterface $node, $targetWorkspaceName = NULL, $indexVariants = TRUE) {
-		if ($indexVariants === TRUE) {
-			$this->indexAllNodeVariants($node);
-			return;
-		}
-
+	public function indexNode(NodeInterface $node, $targetWorkspaceName = NULL) {
 		$identifier = $this->generateUniqueNodeIdentifier($node);
-
 		if ($node->isRemoved()) {
 			$this->indexClient->removeData($identifier);
 			return;
 		}
 
-		$fulltextData = array();
+		$workspaceKey = '#'.$node->getWorkspace()->getName().'#';
+		$this->removeWorkspaceFromExistingEntries($node, $workspaceKey);
+		$this->updateNodeIndex($node, $workspaceKey);
+	}
 
-		if (isset($this->indexedNodeData[$identifier])) {
-			$properties = $this->indexClient->findOneByIdentifier($identifier);
-			$properties['__workspace'] = $properties['__workspace'] . ', #' . ($targetWorkspaceName !== NULL ? $targetWorkspaceName : $node->getContext()->getWorkspaceName() ) . '#';
-			$properties['__dimensionshash'] = $properties['__dimensionshash'] . ', #' . md5(json_encode($node->getContext()->getDimensions())) . '#';
-
-			$this->indexClient->insertOrUpdatePropertiesToIndex($properties, $identifier);
-		} else {
-			$nodePropertiesToBeStoredInIndex = $this->extractPropertiesAndFulltext($node, $fulltextData);
-			if (count($fulltextData) !== 0) {
-				$this->addFulltextToRoot($node, $fulltextData);
+	/**
+	 * Remove workspace from all node entries that reference it.
+	 * Removes orphans without any workspace they relate to.
+	 *
+	 * @param NodeInterface $node
+	 * @param string        $workspaceKey
+	 */
+	protected function removeWorkspaceFromExistingEntries(NodeInterface $node, $workspaceKey) {
+		$allIndexedVariants = $this->indexClient->executeStatement('SELECT * FROM objects WHERE __identifier = :nodeIdentifier', array(
+			':nodeIdentifier' => $node->getIdentifier()
+		));
+		foreach ($allIndexedVariants as $nodeVariant) {
+			if (strpos($nodeVariant['__workspace'], $workspaceKey) !== false) {
+				$removeCurrentWs = str_replace(
+					$workspaceKey,
+					'',
+					$nodeVariant['__workspace']
+				);
+				// if entry has no related workspaces left delete, update otherwiese
+				if (!$removeCurrentWs) {
+					$this->indexClient->removeData($nodeVariant['__identifier__']);
+				} else {
+					$nodeVariant['__workspace'] = $removeCurrentWs;
+					$this->indexClient->insertOrUpdatePropertiesToIndex($nodeVariant, $nodeVariant['__identifier__']);
+				}
 			}
-
-			$this->indexClient->indexData($identifier, $nodePropertiesToBeStoredInIndex, $fulltextData);
-			$this->indexedNodeData[$identifier] = $identifier;
 		}
+	}
+
+	/**
+	 * Update the properties and fulltext for the given node.
+	 * Also adds workspaces from old entry if one exists.
+	 *
+	 * @param NodeInterface $node
+	 * @param string        $workspaceKey
+	 */
+	protected function updateNodeIndex(NodeInterface $node, $workspaceKey) {
+		$fulltextData = array();
+		$nodePropertiesToBeStoredInIndex = $this->extractPropertiesAndFulltext($node, $fulltextData);
+		if (count($fulltextData) !== 0) {
+			$this->addFulltextToRoot($node, $fulltextData);
+		}
+
+		$identifier = $this->generateUniqueNodeIdentifier($node);
+		$oldEntry = $this->indexClient->findOneByIdentifier($identifier);
+		if ($oldEntry && array_key_exists('__workspace', $oldEntry)) {
+			// keep complete list of all workspaces this entry exists in
+			$nodePropertiesToBeStoredInIndex['__workspace'] = $oldEntry['__workspace'];
+
+			// add current workspace if reintegrating into existing entry
+			if (strpos($nodePropertiesToBeStoredInIndex['__workspace'], $workspaceKey) === false) {
+				$nodePropertiesToBeStoredInIndex['__workspace'] .= ', '.$workspaceKey;
+			}
+		}
+
+		$this->indexClient->indexData($identifier, $nodePropertiesToBeStoredInIndex, $fulltextData);
 	}
 
 	/**
@@ -139,23 +176,6 @@ class NodeIndexer extends \TYPO3\TYPO3CR\Search\Indexer\AbstractNodeIndexer {
 	 */
 	public function flush() {
 		$this->indexedNodeData = array();
-	}
-
-	/**
-	 * @param NodeInterface $node
-	 * @return void
-	 */
-	protected function indexAllNodeVariants(NodeInterface $node) {
-		$nodeIdentifier = $node->getIdentifier();
-
-		$allIndexedVariants = $this->indexClient->query('SELECT __identifier__ FROM objects WHERE __identifier = "' . $nodeIdentifier . '"');
-		foreach ($allIndexedVariants as $nodeVariant) {
-			$this->indexClient->removeData($nodeVariant['__identifier__']);
-		}
-
-		foreach ($this->workspaceRepository->findAll() as $workspace) {
-			$this->indexNodeInWorkspace($nodeIdentifier, $workspace->getName());
-		}
 	}
 
 	/**
